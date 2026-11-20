@@ -15,8 +15,9 @@
 #   ./install.sh --force    # réinstalle tout, même si déjà présent
 #   ./install.sh --help
 #
-# Testé sur Fedora 44, mais détecte dnf / apt / pacman / zypper / apk / xbps.
-# Ne pas lancer en root : les paquets système passent par sudo.
+# Testé sur Fedora 44 et prévu pour macOS (Intel & Apple Silicon).
+# Détecte dnf / apt / pacman / zypper / apk / xbps, et Homebrew sur macOS.
+# Ne pas lancer en root : les paquets système passent par sudo (sauf Homebrew).
 
 set -Eeuo pipefail
 
@@ -35,8 +36,22 @@ XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 LOCAL_BIN="$HOME/.local/bin"
 OPT_DIR="$HOME/.local/opt"
 CARGO_BIN="$HOME/.cargo/bin"
-KITTY_APP="$HOME/.local/kitty.app"
 ZSH_CUSTOM_DIR="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}"
+
+IS_MACOS=0
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  IS_MACOS=1
+fi
+
+if [[ $IS_MACOS -eq 1 ]]; then
+  KITTY_APP="$HOME/Applications/kitty.app"
+  KITTY_BIN="$KITTY_APP/Contents/MacOS/kitty"
+else
+  KITTY_APP="$HOME/.local/kitty.app"
+  KITTY_BIN="$KITTY_APP/bin/kitty"
+fi
+
+BREW=""
 
 FORCE=0
 
@@ -69,7 +84,7 @@ on_error() {
 }
 trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
-TMP_DIR="$(mktemp -d)"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/config_install.XXXXXX")"
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
@@ -121,7 +136,7 @@ link_file() {
   local src="$1" dest="$2"
   mkdir -p "$(dirname "$dest")"
   if [[ -L "$dest" ]]; then
-    if [[ "$(readlink -f "$dest")" == "$(readlink -f "$src")" ]]; then
+    if [[ "$dest" -ef "$src" ]]; then
       info "Déjà lié : $dest"
       return 0
     fi
@@ -131,6 +146,17 @@ link_file() {
   fi
   ln -s "$src" "$dest"
   ok "Lien créé : $dest -> $src"
+}
+
+make_wrapper() {
+  local target="$1" wrapper="$2"
+  mkdir -p "$(dirname "$wrapper")"
+  cat > "$wrapper" <<EOF
+#!/bin/sh
+exec "$target" "\$@"
+EOF
+  chmod +x "$wrapper"
+  info "Lanceur créé : $wrapper -> $target"
 }
 
 download() {
@@ -187,6 +213,12 @@ clone_or_update() {
 # ---------------------------------------------------------------------------
 
 detect_pm() {
+  if [[ $IS_MACOS -eq 1 ]]; then
+    ensure_homebrew
+    PM=brew
+    return 0
+  fi
+
   if   have dnf;         then PM=dnf
   elif have apt-get;     then PM=apt
   elif have pacman;      then PM=pacman
@@ -197,11 +229,70 @@ detect_pm() {
   fi
 }
 
+ensure_homebrew() {
+  if have brew; then
+    BREW="$(command -v brew)"
+    return 0
+  fi
+
+  # Homebrew peut être installé mais absent du PATH de cette session
+  local candidate
+  for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [[ -x "$candidate" ]]; then
+      BREW="$candidate"
+      eval "$("$BREW" shellenv)"
+      return 0
+    fi
+  done
+
+  [[ $IS_MACOS -eq 1 ]] || die "Homebrew est introuvable."
+
+  if ! xcode-select -p >/dev/null 2>&1; then
+    die "Xcode Command Line Tools requis. Lance 'xcode-select --install', puis relance ce script."
+  fi
+
+  step "Installation de Homebrew"
+  local installer
+  installer="$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  [[ -n "$installer" ]] || die "Impossible de télécharger l'installeur Homebrew."
+  NONINTERACTIVE=1 /bin/bash -c "$installer"
+
+  if [[ -x /opt/homebrew/bin/brew ]]; then
+    BREW=/opt/homebrew/bin/brew
+  elif [[ -x /usr/local/bin/brew ]]; then
+    BREW=/usr/local/bin/brew
+  else
+    die "Homebrew a été installé mais le binaire 'brew' est introuvable."
+  fi
+  eval "$("$BREW" shellenv)"
+  ok "Homebrew installé : $BREW"
+}
+
+current_user_shell() {
+  local shell_path=""
+  if [[ $IS_MACOS -eq 1 ]] && have dscl; then
+    shell_path="$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null |
+      awk 'NR==1 { print $2 }' || true)"
+  elif [[ $IS_MACOS -eq 1 ]]; then
+    shell_path="${SHELL:-}"
+  else
+    shell_path="$(awk -F: -v u="$(id -un)" '$1 == u { print $7; exit }' /etc/passwd)"
+  fi
+  [[ -n "$shell_path" ]] || shell_path="${SHELL:-}"
+  printf '%s' "$shell_path"
+}
+
 case "$(uname -m)" in
   x86_64|amd64)   NVIM_ARCH="x86_64"; ZELLIJ_ARCH="x86_64" ;;
   aarch64|arm64)  NVIM_ARCH="arm64";  ZELLIJ_ARCH="aarch64" ;;
   *) die "Architecture non supportée : $(uname -m)" ;;
 esac
+
+if [[ $IS_MACOS -eq 1 ]]; then
+  ZELLIJ_TARGET="${ZELLIJ_ARCH}-apple-darwin"
+else
+  ZELLIJ_TARGET="${ZELLIJ_ARCH}-unknown-linux-musl"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Paquets système (git, curl, zsh, vim, outils de compilation…)
@@ -237,12 +328,17 @@ install_system_packages() {
       base="git curl wget tar unzip xz fontconfig base-devel pkg-config openssl-devel"
       pkg_zsh="zsh"; pkg_vim="vim"
       ;;
+    brew)
+      # macOS : zsh et les outils de base sont fournis par le système
+      base="git vim"
+      pkg_zsh=""; pkg_vim=""
+      ;;
   esac
 
   local -a pkgs
   read -r -a pkgs <<< "$base $pkg_zsh $pkg_vim"
 
-  if [[ $EUID -ne 0 ]] && have sudo; then
+  if [[ $PM != "brew" && $EUID -ne 0 ]] && have sudo; then
     sudo -v || warn "Impossible de mettre en cache les droits sudo."
   fi
 
@@ -256,6 +352,7 @@ install_system_packages() {
     zypper) as_root zypper --non-interactive install "${pkgs[@]}" ;;
     apk)    as_root apk add --no-cache "${pkgs[@]}" ;;
     xbps)   as_root xbps-install -Sy "${pkgs[@]}" ;;
+    brew)   "$BREW" install "${pkgs[@]}" ;;
   esac
 
   mkdir -p "$LOCAL_BIN" "$OPT_DIR" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
@@ -271,7 +368,7 @@ set_default_shell() {
   local zsh_bin current_shell
   zsh_bin="$(command -v zsh || true)"
   [[ -n "$zsh_bin" ]] || die "zsh est introuvable après l'installation des paquets."
-  current_shell="$(awk -F: -v u="$(id -un)" '$1 == u { print $7; exit }' /etc/passwd)"
+  current_shell="$(current_user_shell)"
 
   if [[ "$current_shell" == "$zsh_bin" ]]; then
     ok "zsh est déjà le shell par défaut."
@@ -284,7 +381,11 @@ set_default_shell() {
     echo "$zsh_bin" | as_root tee -a /etc/shells >/dev/null || \
       warn "Impossible d'ajouter $zsh_bin à /etc/shells."
   fi
-  if [[ $EUID -eq 0 ]]; then
+  if [[ $IS_MACOS -eq 1 ]]; then
+    if ! chsh -s "$zsh_bin"; then
+      warn "chsh a échoué. Change le shell manuellement (Réglages Système > Utilisateurs)."
+    fi
+  elif [[ $EUID -eq 0 ]]; then
     chsh -s "$zsh_bin" "$(id -un)"
   elif have sudo; then
     if ! sudo chsh -s "$zsh_bin" "$(id -un)"; then
@@ -294,7 +395,7 @@ set_default_shell() {
     warn "chsh a échoué. Change le shell manuellement."
   fi
 
-  current_shell="$(awk -F: -v u="$(id -un)" '$1 == u { print $7; exit }' /etc/passwd)"
+  current_shell="$(current_user_shell)"
   if [[ "$current_shell" == "$zsh_bin" ]]; then
     ok "zsh est maintenant le shell par défaut."
   fi
@@ -310,8 +411,10 @@ install_oh_my_zsh() {
     ok "Oh My Zsh est déjà installé."
   else
     info "Installation de Oh My Zsh (sans lancer zsh, sans changer le shell)…"
-    RUNZSH=no CHSH=no KEEP_ZSHRC=yes \
-      sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+    local omz_installer
+    omz_installer="$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+    [[ -n "$omz_installer" ]] || die "Impossible de télécharger l'installeur Oh My Zsh."
+    RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c "$omz_installer"
     ok "Oh My Zsh installé."
   fi
 
@@ -403,7 +506,13 @@ install_neovim() {
   if [[ "$installed" == "$version" && $FORCE -eq 0 ]]; then
     ok "Neovim $version est déjà installé."
   else
-    url="$(latest_asset neovim/neovim "nvim-linux-${NVIM_ARCH}[.]tar[.]gz$")"
+    local asset_pattern
+    if [[ $IS_MACOS -eq 1 ]]; then
+      asset_pattern="nvim-macos-${NVIM_ARCH}[.]tar[.]gz$"
+    else
+      asset_pattern="nvim-linux-${NVIM_ARCH}[.]tar[.]gz$"
+    fi
+    url="$(latest_asset neovim/neovim "$asset_pattern")"
     download "$url" "$TMP_DIR/nvim.tar.gz"
 
     info "Extraction dans $OPT_DIR/nvim"
@@ -467,7 +576,7 @@ install_zellij() {
   if [[ "$installed" == "$version" && $FORCE -eq 0 ]]; then
     ok "Zellij $version est déjà installé."
   else
-    url="$(latest_asset zellij-org/zellij "zellij-${ZELLIJ_ARCH}-unknown-linux-musl[.]tar[.]gz$")"
+    url="$(latest_asset zellij-org/zellij "zellij-${ZELLIJ_TARGET}[.]tar[.]gz$")"
     download "$url" "$TMP_DIR/zellij.tar.gz"
 
     info "Extraction dans $OPT_DIR/zellij"
@@ -494,19 +603,42 @@ install_zellij() {
 
 install_nerd_font() {
   step "JetBrains Mono Nerd Font (userland)"
-  local font_dir="$XDG_DATA_HOME/fonts/JetBrainsMonoNerdFont"
+  local font_dir existing
 
-  if [[ -d "$font_dir" && -n "$(find "$font_dir" -name '*.ttf' -print -quit 2>/dev/null)" && $FORCE -eq 0 ]]; then
+  if [[ $IS_MACOS -eq 1 ]]; then
+    font_dir="$HOME/Library/Fonts"
+  else
+    font_dir="$XDG_DATA_HOME/fonts/JetBrainsMonoNerdFont"
+  fi
+  mkdir -p "$font_dir"
+
+  if [[ $IS_MACOS -eq 1 ]]; then
+    existing="$(find "$font_dir" -name 'JetBrainsMonoNerdFont*.ttf' -print 2>/dev/null | awk 'NR==1')"
+  else
+    existing="$(find "$font_dir" -name '*.ttf' -print 2>/dev/null | awk 'NR==1')"
+  fi
+
+  if [[ -n "$existing" && $FORCE -eq 0 ]]; then
     ok "Police déjà installée dans $font_dir"
   else
     download "$NERD_FONT_URL" "$TMP_DIR/JetBrainsMono.zip"
-    rm -rf "$font_dir"
-    mkdir -p "$font_dir"
-    unzip -q -o "$TMP_DIR/JetBrainsMono.zip" -d "$font_dir"
+    rm -rf "$TMP_DIR/fonts"
+    mkdir -p "$TMP_DIR/fonts"
+    unzip -q -o "$TMP_DIR/JetBrainsMono.zip" -d "$TMP_DIR/fonts"
+
+    if [[ $IS_MACOS -eq 1 ]]; then
+      rm -f "$font_dir"/JetBrainsMonoNerdFont*.ttf
+    else
+      rm -rf "$font_dir"
+      mkdir -p "$font_dir"
+    fi
+    find "$TMP_DIR/fonts" -name '*.ttf' -exec cp -f {} "$font_dir"/ \;
     ok "Police extraite dans $font_dir"
   fi
 
-  if have fc-cache; then
+  if [[ $IS_MACOS -eq 1 ]]; then
+    ok "Police disponible pour macOS (aucun cache à reconstruire)."
+  elif have fc-cache; then
     fc-cache -f "$XDG_DATA_HOME/fonts" >/dev/null
     ok "Cache de polices mis à jour."
   else
@@ -520,27 +652,40 @@ install_nerd_font() {
 
 install_kitty() {
   step "Kitty (binaire officiel)"
-  if [[ -x "$KITTY_APP/bin/kitty" && $FORCE -eq 0 ]]; then
-    ok "Kitty est déjà installé ($("$KITTY_APP/bin/kitty" --version 2>/dev/null | awk 'NR==1'))."
+  if [[ -x "$KITTY_BIN" && $FORCE -eq 0 ]]; then
+    ok "Kitty est déjà installé ($("$KITTY_BIN" --version 2>/dev/null | awk 'NR==1'))."
   else
     info "Téléchargement et installation via l'installeur officiel…"
-    curl -fsSL https://sw.kovidgoyal.net/kitty/installer.sh | sh /dev/stdin launch=n
+    if [[ $IS_MACOS -eq 1 ]]; then
+      mkdir -p "$HOME/Applications"
+      curl -fsSL https://sw.kovidgoyal.net/kitty/installer.sh |
+        sh /dev/stdin launch=n dest="$HOME/Applications"
+    else
+      curl -fsSL https://sw.kovidgoyal.net/kitty/installer.sh | sh /dev/stdin launch=n
+    fi
     ok "Kitty installé dans $KITTY_APP"
   fi
 
-  ln -sfn "$KITTY_APP/bin/kitty" "$LOCAL_BIN/kitty"
-  ln -sfn "$KITTY_APP/bin/kitten" "$LOCAL_BIN/kitten"
+  if [[ $IS_MACOS -eq 1 ]]; then
+    make_wrapper "$KITTY_BIN" "$LOCAL_BIN/kitty"
+    if [[ -x "$KITTY_APP/Contents/MacOS/kitten" ]]; then
+      make_wrapper "$KITTY_APP/Contents/MacOS/kitten" "$LOCAL_BIN/kitten"
+    fi
+  else
+    ln -sfn "$KITTY_APP/bin/kitty" "$LOCAL_BIN/kitty"
+    ln -sfn "$KITTY_APP/bin/kitten" "$LOCAL_BIN/kitten"
 
-  # Intégration au menu d'applications (KDE/GNOME…)
-  local desktop_src="$KITTY_APP/share/applications/kitty.desktop"
-  if [[ -f "$desktop_src" ]]; then
-    mkdir -p "$XDG_DATA_HOME/applications"
-    sed -e "s|^Exec=kitty|Exec=$KITTY_APP/bin/kitty|" \
-        -e "s|^TryExec=kitty|TryExec=$KITTY_APP/bin/kitty|" \
-        -e "s|^Icon=kitty|Icon=$KITTY_APP/share/icons/hicolor/256x256/apps/kitty.png|" \
-        "$desktop_src" > "$XDG_DATA_HOME/applications/kitty.desktop"
-    if have update-desktop-database; then
-      update-desktop-database "$XDG_DATA_HOME/applications" >/dev/null 2>&1 || true
+    # Intégration au menu d'applications (KDE/GNOME…)
+    local desktop_src="$KITTY_APP/share/applications/kitty.desktop"
+    if [[ -f "$desktop_src" ]]; then
+      mkdir -p "$XDG_DATA_HOME/applications"
+      sed -e "s|^Exec=kitty|Exec=$KITTY_APP/bin/kitty|" \
+          -e "s|^TryExec=kitty|TryExec=$KITTY_APP/bin/kitty|" \
+          -e "s|^Icon=kitty|Icon=$KITTY_APP/share/icons/hicolor/256x256/apps/kitty.png|" \
+          "$desktop_src" > "$XDG_DATA_HOME/applications/kitty.desktop"
+      if have update-desktop-database; then
+        update-desktop-database "$XDG_DATA_HOME/applications" >/dev/null 2>&1 || true
+      fi
     fi
   fi
 
@@ -562,7 +707,7 @@ configure_zshrc() {
   # Liste de plugins (Oh My Zsh la lit avant de se charger)
   if grep -qE '^plugins=\(' "$rc"; then
     local inner
-    inner="$(grep -m1 -E '^plugins=\(' "$rc")"
+    inner="$(awk '/^plugins=\(/ { print; exit }' "$rc")"
     inner="${inner#plugins=(}"
     inner="${inner%)}"
     inner="${inner# }"; inner="${inner% }"
@@ -596,6 +741,13 @@ configure_zshrc() {
 # >>> config_install >>>
 export PATH="$HOME/.local/bin:$PATH"
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
+# Homebrew (macOS)
+if [ -x /opt/homebrew/bin/brew ]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [ -x /usr/local/bin/brew ]; then
+  eval "$(/usr/local/bin/brew shellenv)"
+fi
 
 # Binaires userland
 alias nvim='$HOME/.local/opt/nvim/bin/nvim'
