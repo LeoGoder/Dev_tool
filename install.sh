@@ -5,6 +5,7 @@
 #   - Zsh + Oh My Zsh + plugins d'autocomplétion
 #   - Rust (rustup) + Starship (preset Catppuccin Powerline)
 #   - Neovim (dernière release, tarball) + ta config
+#   - LazyGit (dernière release, binaire) + alias
 #   - Vim (gestionnaire de paquets) + ton vimrc
 #   - Zellij (dernière release) + ta config
 #   - JetBrains Mono Nerd Font (userland)
@@ -331,9 +332,12 @@ esac
 
 if [[ $IS_MACOS -eq 1 ]]; then
   ZELLIJ_TARGET="${ZELLIJ_ARCH}-apple-darwin"
+  LAZYGIT_OS="darwin"
 else
   ZELLIJ_TARGET="${ZELLIJ_ARCH}-unknown-linux-musl"
+  LAZYGIT_OS="linux"
 fi
+LAZYGIT_ARCH="$NVIM_ARCH"
 
 # ---------------------------------------------------------------------------
 # 1. Paquets système (git, curl, zsh, vim, outils de compilation…)
@@ -695,7 +699,42 @@ install_zellij() {
 }
 
 # ---------------------------------------------------------------------------
-# 8. JetBrains Mono Nerd Font (userland)
+# 8. LazyGit (dernière release, binaire) + alias
+# ---------------------------------------------------------------------------
+
+install_lazygit() {
+  step "LazyGit (dernière release)"
+  local tag version url installed
+  tag="$(latest_tag jesseduffield/lazygit)"
+  version="${tag#v}"
+
+  installed=""
+  if [[ -x "$OPT_DIR/lazygit/lazygit" ]]; then
+    installed="$("$OPT_DIR/lazygit/lazygit" --version 2>/dev/null |
+      awk -F', ' '
+        { for (i = 1; i <= NF; i++) if (found == "" && $i ~ /^version=/) { sub(/^version=/, "", $i); found = $i } }
+        END { if (found != "") print found }')"
+  fi
+
+  if [[ "$installed" == "$version" && $FORCE -eq 0 ]]; then
+    ok "LazyGit $version est déjà installé."
+  else
+    url="$(latest_asset jesseduffield/lazygit "lazygit_[0-9.]+_${LAZYGIT_OS}_${LAZYGIT_ARCH}[.]tar[.]gz$")"
+    download "$url" "$TMP_DIR/lazygit.tar.gz"
+
+    info "Extraction dans $OPT_DIR/lazygit"
+    rm -rf "$OPT_DIR/lazygit"
+    mkdir -p "$OPT_DIR/lazygit"
+    tar -xzf "$TMP_DIR/lazygit.tar.gz" -C "$OPT_DIR/lazygit"
+    chmod +x "$OPT_DIR/lazygit/lazygit"
+
+    [[ -x "$OPT_DIR/lazygit/lazygit" ]] || die "Le binaire lazygit est introuvable après extraction."
+    ok "LazyGit $version installé dans $OPT_DIR/lazygit"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 9. JetBrains Mono Nerd Font (userland)
 # ---------------------------------------------------------------------------
 
 install_nerd_font() {
@@ -744,7 +783,7 @@ install_nerd_font() {
 }
 
 # ---------------------------------------------------------------------------
-# 9. Kitty (binaire officiel)
+# 10. Kitty (binaire officiel)
 # ---------------------------------------------------------------------------
 
 install_kitty() {
@@ -790,7 +829,7 @@ install_kitty() {
 }
 
 # ---------------------------------------------------------------------------
-# 10. ~/.zshrc : plugins, PATH, alias, starship
+# 11. ~/.zshrc : plugins, PATH, alias, starship
 # ---------------------------------------------------------------------------
 
 configure_zshrc() {
@@ -849,6 +888,7 @@ fi
 # Binaires userland
 alias nvim='$HOME/.local/opt/nvim/bin/nvim'
 alias zellij='$HOME/.local/opt/zellij/zellij'
+alias lazygit='$HOME/.local/opt/lazygit/lazygit'
 # vim est fourni par le gestionnaire de paquets : aucun alias nécessaire.
 
 # Prompt Starship (preset Catppuccin Powerline dans ~/.config/starship.toml)
@@ -858,7 +898,7 @@ fi
 # <<< config_install <<<
 ZSH_BLOCK
 
-  ok "~/.zshrc configuré (plugins, PATH, alias nvim/zellij, Starship)."
+  ok "~/.zshrc configuré (plugins, PATH, alias nvim/zellij/lazygit, Starship)."
 }
 
 # ---------------------------------------------------------------------------
@@ -893,6 +933,7 @@ else
 fi
 
 install_zellij
+install_lazygit
 install_nerd_font
 install_kitty
 configure_zshrc
@@ -906,6 +947,7 @@ printf '    %-10s %s\n' "zsh"      "$(zsh --version 2>/dev/null || echo absent)"
 printf '    %-10s %s\n' "vim"      "$(vim --version 2>/dev/null | awk 'NR==1' || echo absent)"
 printf '    %-10s %s\n' "nvim"     "$("$OPT_DIR/nvim/bin/nvim" --version 2>/dev/null | awk 'NR==1' || echo absent)"
 printf '    %-10s %s\n' "zellij"   "$("$OPT_DIR/zellij/zellij" --version 2>/dev/null || echo absent)"
+printf '    %-10s %s\n' "lazygit"  "$("$OPT_DIR/lazygit/lazygit" --version 2>/dev/null | awk -F', ' '{ for (i = 1; i <= NF; i++) if (found == "" && $i ~ /^version=/) { sub(/^version=/, "", $i); found = $i } } END { if (found != "") print found }' || echo absent)"
 printf '    %-10s %s\n' "starship" "$("$CARGO_BIN/starship" --version 2>/dev/null || echo absent)"
 printf '    %-10s %s\n' "kitty"    "$("$LOCAL_BIN/kitty" --version 2>/dev/null | awk 'NR==1' || echo absent)"
 printf '    %-10s %s\n' "rust"     "$("$CARGO_BIN/rustc" --version 2>/dev/null || echo absent)"
