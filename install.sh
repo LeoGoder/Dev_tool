@@ -865,11 +865,38 @@ configure_zshrc() {
     printf '\nplugins=(git zsh-autosuggestions zsh-syntax-highlighting)\n' >> "$rc"
   fi
 
+  # Activation de Oh My Zsh : l'installeur conserve un ~/.zshrc existant
+  # (KEEP_ZSHRC=yes), ces lignes peuvent donc manquer sur une machine où le
+  # fichier existait déjà. On les ajoute uniquement si nécessaire.
+  local omz_dir="$HOME/.oh-my-zsh"
+  if ! grep -qE '^[[:space:]]*export[[:space:]]+ZSH=' "$rc"; then
+    info "Ajout de export ZSH dans ~/.zshrc"
+    awk -v line="export ZSH=\"$omz_dir\"" '
+      !done && /^plugins=\(/ { print line; done = 1 }
+      { print }
+      END { if (!done) print line }' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
+  fi
+
+  if ! grep -qE '^[[:space:]]*(source|\.)[[:space:]]+.*oh-my-zsh\.sh' "$rc"; then
+    info "Ajout de source \$ZSH/oh-my-zsh.sh dans ~/.zshrc"
+    awk '
+      !done && /^plugins=\(/ { print; print "source \"$ZSH/oh-my-zsh.sh\""; done = 1; next }
+      { print }
+      END { if (!done) print "source \"$ZSH/oh-my-zsh.sh\"" }' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
+  fi
+
   # Bloc géré, réécrit à chaque exécution
   awk '
     /^# >>> config_install >>>$/ { skip = 1; next }
     /^# <<< config_install <<<$/ { skip = 0; next }
     !skip { print }
+  ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
+
+  # Supprime les lignes vides finales pour éviter qu'elles ne s'accumulent
+  # à chaque exécution avant le bloc géré ci-dessous.
+  awk '
+    /^[[:space:]]*$/ { pending = pending $0 "\n"; next }
+    { printf "%s", pending; pending = ""; print }
   ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
 
   cat >> "$rc" <<'ZSH_BLOCK'
