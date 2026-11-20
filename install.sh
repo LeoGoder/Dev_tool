@@ -10,9 +10,16 @@
 #   - JetBrains Mono Nerd Font (userland)
 #   - Kitty (binaire officiel)
 #
+# Au démarrage, le script demande s'il peut utiliser sudo. En cas de refus,
+# aucun paquet système n'est installé : zsh est lancé depuis ~/.bashrc et Vim
+# n'est pas installé. Le reste (Rust, Starship, Neovim, Zellij, police, Kitty)
+# s'installe dans le home de l'utilisateur.
+#
 # Usage :
-#   ./install.sh            # installe / met à jour
+#   ./install.sh            # demande pour sudo, puis installe / met à jour
 #   ./install.sh --force    # réinstalle tout, même si déjà présent
+#   ./install.sh --sudo     # force l'utilisation de sudo (pas de question)
+#   ./install.sh --no-sudo  # mode sans sudo (pas de question)
 #   ./install.sh --help
 #
 # Testé sur Fedora 44 et prévu pour macOS (Intel & Apple Silicon).
@@ -54,6 +61,8 @@ fi
 BREW=""
 
 FORCE=0
+USE_SUDO=""
+BASHRC_ZSH=0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -94,18 +103,24 @@ trap cleanup EXIT
 
 usage() {
   cat <<EOF
-Usage: ${0##*/} [--force] [--help]
+Usage: ${0##*/} [--force] [--sudo|--no-sudo] [--help]
 
-  -f, --force   Réinstalle les composants déjà présents
-  -h, --help    Affiche cette aide
+  -f, --force     Réinstalle les composants déjà présents
+      --sudo      Utilise sudo sans poser la question
+      --no-sudo   Refuse sudo sans poser la question
+  -h, --help      Affiche cette aide
+
+Sans sudo : pas de paquets système ni de Vim, et zsh est lancé depuis ~/.bashrc.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -f|--force) FORCE=1 ;;
-    -h|--help)  usage; exit 0 ;;
-    *)          die "Option inconnue : $1 (voir --help)" ;;
+    -f|--force)   FORCE=1 ;;
+    --sudo)       USE_SUDO=1 ;;
+    --no-sudo)    USE_SUDO=0 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            die "Option inconnue : $1 (voir --help)" ;;
   esac
   shift
 done
@@ -113,6 +128,32 @@ done
 [[ $EUID -eq 0 ]] && die "Ne lance pas ce script en root : il utilise sudo là où c'est nécessaire."
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+ask_sudo() {
+  [[ -n "$USE_SUDO" ]] && return 0
+
+  if [[ -t 0 ]]; then
+    printf '%s\n' "${C_BOLD}Autoriser l'utilisation de sudo ?${C_RESET}"
+    printf '  Oui : paquets système (zsh, vim, git…) + changement de shell par défaut.\n'
+    printf '  Non : zsh sera lancé depuis ~/.bashrc, Vim ne sera pas installé.\n'
+    printf 'Utiliser sudo ? [Y/n] '
+    local reply=""
+    read -r reply || true
+    case "$reply" in
+      ""|y|Y|yes|YES|o|O|oui|OUI|Oui) USE_SUDO=1 ;;
+      *) USE_SUDO=0 ;;
+    esac
+  else
+    warn "Aucun terminal interactif : mode sans sudo par défaut."
+    USE_SUDO=0
+  fi
+
+  if [[ $USE_SUDO -eq 1 ]]; then
+    info "Mode avec sudo."
+  else
+    info "Mode sans sudo : aucun paquet système ne sera installé."
+  fi
+}
 
 as_root() {
   if [[ $EUID -eq 0 ]]; then
@@ -357,6 +398,62 @@ install_system_packages() {
 
   mkdir -p "$LOCAL_BIN" "$OPT_DIR" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
   ok "Paquets système installés (git, curl, zsh, vim…)"
+}
+
+prepare_dirs() {
+  mkdir -p "$LOCAL_BIN" "$OPT_DIR" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
+}
+
+check_userland_deps() {
+  step "Dépendances (mode sans sudo)"
+  local cmd missing=()
+  for cmd in git curl tar unzip awk sed grep find cmp zsh; do
+    have "$cmd" || missing+=("$cmd")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    die "Commandes manquantes : ${missing[*]}. Installe-les manuellement ou relance avec sudo."
+  fi
+  ok "Dépendances disponibles : git, curl, tar, unzip, zsh…"
+}
+
+configure_bashrc_zsh() {
+  step "Zsh depuis ~/.bashrc (sans sudo)"
+  local zsh_bin rc="$HOME/.bashrc" stamp
+  zsh_bin="$(command -v zsh || true)"
+  [[ -n "$zsh_bin" ]] || die "zsh est introuvable. Installe-le manuellement ou relance avec sudo."
+
+  touch "$rc"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  cp -a "$rc" "${rc}.bak.${stamp}"
+  info "Sauvegarde : ${rc}.bak.${stamp}"
+
+  # Retire un éventuel ancien bloc géré
+  awk '
+    /^# >>> config_install zsh >>>$/ { skip = 1; next }
+    /^# <<< config_install zsh <<<$/ { skip = 0; next }
+    !skip { print }
+  ' "$rc" > "$rc.tmp" && mv "$rc.tmp" "$rc"
+
+  if [[ "$(current_user_shell)" == "$zsh_bin" ]]; then
+    ok "zsh est déjà le shell par défaut, ~/.bashrc inchangé."
+    return 0
+  fi
+
+  cat >> "$rc" <<'BASH_BLOCK'
+
+# >>> config_install zsh >>>
+# Pas de sudo : impossible de changer le shell par défaut avec chsh.
+# On lance zsh automatiquement dans les shells bash interactifs.
+if [ -n "$BASH_VERSION" ] && [ -z "$ZSH_VERSION" ] && command -v zsh >/dev/null 2>&1; then
+  case $- in
+    *i*) exec zsh ;;
+  esac
+fi
+# <<< config_install zsh <<<
+BASH_BLOCK
+
+  BASHRC_ZSH=1
+  ok "zsh sera lancé automatiquement depuis ~/.bashrc."
 }
 
 # ---------------------------------------------------------------------------
@@ -772,13 +869,29 @@ printf '%s\n' "${C_BOLD}Installation de l'environnement de travail${C_RESET}"
 info "Système : $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-inconnu}" || uname -s) ($(uname -m))"
 info "Utilisateur : $(id -un) — HOME : $HOME"
 
-install_system_packages
-set_default_shell
+ask_sudo
+prepare_dirs
+
+if [[ $USE_SUDO -eq 1 ]]; then
+  install_system_packages
+  set_default_shell
+else
+  check_userland_deps
+  configure_bashrc_zsh
+fi
+
 install_oh_my_zsh
 install_rust
 install_starship
 install_neovim
-install_vim_config
+
+if [[ $USE_SUDO -eq 1 ]]; then
+  install_vim_config
+else
+  step "Vim"
+  info "Installation de Vim ignorée (mode sans sudo)."
+fi
+
 install_zellij
 install_nerd_font
 install_kitty
@@ -798,5 +911,12 @@ printf '    %-10s %s\n' "kitty"    "$("$LOCAL_BIN/kitty" --version 2>/dev/null |
 printf '    %-10s %s\n' "rust"     "$("$CARGO_BIN/rustc" --version 2>/dev/null || echo absent)"
 
 printf '\n%sInstallation terminée.%s\n' "$C_GREEN$C_BOLD" "$C_RESET"
+if [[ $USE_SUDO -eq 0 ]]; then
+  if [[ $BASHRC_ZSH -eq 1 ]]; then
+    printf "Mode sans sudo : zsh est lancé via ~/.bashrc et Vim n'a pas été installé.\\n"
+  else
+    printf "Mode sans sudo : Vim n'a pas été installé.\\n"
+  fi
+fi
 printf 'Ouvre un nouveau terminal (ou lance `exec zsh`) pour charger la configuration.\n'
 printf 'Pense à définir JetBrainsMono Nerd Font dans les réglages de ton terminal.\n'
