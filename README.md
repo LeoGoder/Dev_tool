@@ -54,8 +54,12 @@ At startup, the script asks whether it may use sudo:
 ## Supported systems
 
 - **Linux**: dnf, apt, pacman, zypper, apk or xbps.
-- **macOS**: Intel and Apple Silicon, via Homebrew (installed automatically if
-  missing). Xcode Command Line Tools are required.
+- **macOS**: Apple Silicon, via Homebrew (installed automatically if missing).
+  Xcode Command Line Tools are required.
+- **macOS Intel**: Homebrew no longer accepts new installs on Intel, so the
+  script falls back to the system tools (`git`, `vim`, `zsh`) provided by the
+  Xcode Command Line Tools. An existing Homebrew installation in
+  `/usr/local/bin` is still used if present.
 
 ## After installation
 

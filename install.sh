@@ -25,6 +25,7 @@
 #
 # Testé sur Fedora 44 et prévu pour macOS (Intel & Apple Silicon).
 # Détecte dnf / apt / pacman / zypper / apk / xbps, et Homebrew sur macOS.
+# Sur macOS Intel sans Homebrew, repli sur les outils système (Xcode CLT).
 # Ne pas lancer en root : les paquets système passent par sudo (sauf Homebrew).
 
 set -Eeuo pipefail
@@ -257,7 +258,11 @@ clone_or_update() {
 detect_pm() {
   if [[ $IS_MACOS -eq 1 ]]; then
     ensure_homebrew
-    PM=brew
+    if [[ -n "$BREW" ]]; then
+      PM=brew
+    else
+      PM=macos
+    fi
     return 0
   fi
 
@@ -289,6 +294,16 @@ ensure_homebrew() {
 
   [[ $IS_MACOS -eq 1 ]] || die "Homebrew est introuvable."
 
+  # Homebrew refuse macOS Intel depuis 2026 (abort dans install.sh amont).
+  # Dans ce cas, on se rabat sur les outils fournis par macOS et les
+  # Xcode Command Line Tools (git, vim, zsh) au lieu d'échouer.
+  if [[ "$(uname -m)" != "arm64" ]]; then
+    warn "Homebrew n'est plus installable sur macOS $(uname -m) : support Intel abandonné en 2026."
+    warn "Repli sur les outils système (git, vim, zsh via Xcode Command Line Tools)."
+    BREW=""
+    return 0
+  fi
+
   if ! xcode-select -p >/dev/null 2>&1; then
     die "Xcode Command Line Tools requis. Lance 'xcode-select --install', puis relance ce script."
   fi
@@ -308,6 +323,22 @@ ensure_homebrew() {
   fi
   eval "$("$BREW" shellenv)"
   ok "Homebrew installé : $BREW"
+}
+
+# Fallback macOS Intel sans Homebrew : vérifie les outils système.
+ensure_macos_tools() {
+  if ! xcode-select -p >/dev/null 2>&1; then
+    die "Xcode Command Line Tools requis. Lance 'xcode-select --install', puis relance ce script."
+  fi
+
+  local cmd missing=()
+  for cmd in git vim zsh curl tar unzip; do
+    have "$cmd" || missing+=("$cmd")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    die "Commandes manquantes : ${missing[*]}. Installe-les manuellement."
+  fi
+  ok "Outils système disponibles : git, vim, zsh…"
 }
 
 current_user_shell() {
@@ -345,7 +376,9 @@ LAZYGIT_ARCH="$NVIM_ARCH"
 
 install_system_packages() {
   detect_pm
-  step "Paquets système ($PM)"
+  local pm_label="$PM"
+  [[ "$PM" == "macos" ]] && pm_label="outils système macOS"
+  step "Paquets système ($pm_label)"
 
   local base pkg_zsh pkg_vim
   case "$PM" in
@@ -378,12 +411,16 @@ install_system_packages() {
       base="git vim"
       pkg_zsh=""; pkg_vim=""
       ;;
+    macos)
+      # macOS Intel sans Homebrew : rien à installer, on vérifie les outils
+      base=""; pkg_zsh=""; pkg_vim=""
+      ;;
   esac
 
   local -a pkgs
   read -r -a pkgs <<< "$base $pkg_zsh $pkg_vim"
 
-  if [[ $PM != "brew" && $EUID -ne 0 ]] && have sudo; then
+  if [[ $PM != "brew" && $PM != "macos" && $EUID -ne 0 ]] && have sudo; then
     sudo -v || warn "Impossible de mettre en cache les droits sudo."
   fi
 
@@ -398,10 +435,15 @@ install_system_packages() {
     apk)    as_root apk add --no-cache "${pkgs[@]}" ;;
     xbps)   as_root xbps-install -Sy "${pkgs[@]}" ;;
     brew)   "$BREW" install "${pkgs[@]}" ;;
+    macos)  ensure_macos_tools ;;
   esac
 
   mkdir -p "$LOCAL_BIN" "$OPT_DIR" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
-  ok "Paquets système installés (git, curl, zsh, vim…)"
+  if [[ $PM == "macos" ]]; then
+    ok "Aucun paquet à installer (outils système macOS)."
+  else
+    ok "Paquets système installés (git, curl, zsh, vim…)"
+  fi
 }
 
 prepare_dirs() {
